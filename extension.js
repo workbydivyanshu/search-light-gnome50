@@ -18,12 +18,15 @@
  */
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
+import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
+import Graphene from 'gi://Graphene';
 import { trySpawnCommandLine } from 'resource:///org/gnome/shell/misc/util.js';
 
 import { Timer } from './timer.js';
@@ -55,6 +58,8 @@ var SearchLight = GObject.registerClass(
 
 export default class SearchLightExt extends Extension {
   enable() {
+    Main.overview.graphene = Graphene;
+    
     this._style = new Style();
 
     this._hiTimer = new Timer('hi-res timer');
@@ -164,9 +169,9 @@ export default class SearchLightExt extends Extension {
     this._animationSpeed = this._settings.get_double('animation-speed');
 
     Main.overview.connectObject(
-      'showing',
+      'overview-showing',
       this._onOverviewShowing.bind(this),
-      'hidden',
+      'overview-hidden',
       this._onOverviewHidden.bind(this),
       this,
     );
@@ -179,7 +184,7 @@ export default class SearchLightExt extends Extension {
 
     global.display.connectObject(
       'window-created',
-      () => {
+      (display, win) => {
         if (this._visible) {
           this.mainContainer.opacity = 0;
         }
@@ -192,6 +197,10 @@ export default class SearchLightExt extends Extension {
     }, 500);
 
     Main.overview.searchLight = this;
+
+    let appInfo = Gio.DesktopAppInfo.new_from_filename(
+      `${this.path}/apps/org.gnome.Calculator.desktop`,
+    );
 
     let _providers = [];
 
@@ -212,25 +221,17 @@ export default class SearchLightExt extends Extension {
   }
 
   disable() {
-    // Prevent show()/hide() from executing during teardown
-    this._disablePending = true;
+    try {
+      this._release_ui();
+      this._remove_events();
+    } catch (e) {
+      logError(e);
+    }
 
-    // Cancel any pending deferred callbacks
     this._hiTimer?.shutdown();
     this._loTimer?.shutdown();
     this._hiTimer = null;
     this._loTimer = null;
-
-    // If the search light was open, release the UI (restore monkey-patches)
-    // and remove event handlers before tearing down the rest
-    if (this._entry) {
-      this._remove_events();
-      this._release_ui();
-    } else {
-      // Clean up enable-level signal connections if _release_ui wasn't used
-      Main.overview.disconnectObject(this);
-      Shell.AppSystem.get_default().disconnectObject(this);
-    }
 
     if (this._indicator) {
       this._indicator.disconnectObject(this);
@@ -270,12 +271,8 @@ export default class SearchLightExt extends Extension {
       this._background = null;
     }
 
-    this._blurEffect = null;
-
-    if (this.mainContainer) {
-      Main.layoutManager.removeChrome(this.mainContainer);
-      this.mainContainer = null;
-    }
+    Main.layoutManager.removeChrome(this.mainContainer);
+    this.mainContainer = null;
   }
 
   _createIndicator() {
@@ -298,7 +295,7 @@ export default class SearchLightExt extends Extension {
       Main.panel._rightBox.insert_child_at_index(this._indicator, 0);
       this._indicator.visible = this.show_panel_icon;
     } catch (err) {
-      logError(err);
+      console.log(err);
     }
   }
 
@@ -335,7 +332,7 @@ export default class SearchLightExt extends Extension {
 
   _updateBlurredBackground() {
     this.desktop_background = this._desktopSettings.get_string('picture-uri');
-
+    
     let uuid = GLib.get_user_name();
     this.desktop_background_blurred = `/tmp/searchlight-${uuid}-bg-blurred.jpg`;
 
@@ -344,9 +341,9 @@ export default class SearchLightExt extends Extension {
       //   let bg = this._desktopSettings.get_string('picture-uri');
       //   let a = Math.floor(100 - color[3] * 100);
       //   let rgb = this._style.hex(color);
-      //   let cmd = `convert -scale 10% -blur 0x2.5 -resize 200% -fill "${rgb}" -tint ${a} "${bg}" ${this.desktop_background_blurred}`;
+      // 	 let cmd = `convert -scale 10% -blur 0x2.5 -resize 200% -fill "${rgb}" -tint ${a} "${bg}" ${this.desktop_background_blurred}`;
       let cmd = `convert -scale 10% -blur 0x2.5 -resize 200% "${this.desktop_background}" ${this.desktop_background_blurred}`;
-      log(cmd);
+      console.log(cmd);
       trySpawnCommandLine(cmd);
     }
   }
@@ -362,7 +359,7 @@ export default class SearchLightExt extends Extension {
     this.windowEffect = effect;
   }
 
-  _updatePanelIcon(_disable) {}
+  _updatePanelIcon(disable) {}
 
   _updateProviders() {
     this._removeProviders();
@@ -448,7 +445,6 @@ export default class SearchLightExt extends Extension {
 
   show() {
     if (Main.overview.visible) return;
-    if (this._disablePending) return;
 
     if (this._animSeq) {
       this._hiTimer.cancel(this._animSeq);
@@ -466,7 +462,6 @@ export default class SearchLightExt extends Extension {
 
     global.compositor.disable_unredirect();
 
-    if (!this.mainContainer) return;
     this.mainContainer.show();
     this.container.show();
     this._add_events();
@@ -474,7 +469,6 @@ export default class SearchLightExt extends Extension {
     // fixes the background size relative to text - after adjusting font size
     this._animSeq = this._hiTimer.runOnce(() => {
       this._animSeq = null;
-      if (!this.mainContainer || this._disablePending) return;
       this._layout();
       // animate after adjust so width+height are correct
       if (this._useAnimations) {
@@ -493,7 +487,6 @@ export default class SearchLightExt extends Extension {
           mode: Clutter.AnimationMode.EASE_OUT,
         });
       } else {
-        if (!this.mainContainer) return;
         this.mainContainer.scale_x = 1.0;
         this.mainContainer.scale_y = 1.0;
         this.mainContainer.opacity = 255;
@@ -505,17 +498,9 @@ export default class SearchLightExt extends Extension {
     if (this._isDraggingIcon()) {
       return;
     }
-    if (this._disablePending) return;
 
-    if (this._animSeq) {
-      this._hiTimer.cancel(this._animSeq);
-      this._animSeq = null;
-    }
-
-    this._remove_events();
     this._release_ui();
-
-    if (!this.mainContainer) return;
+    this._remove_events();
 
     if (this._useAnimations) {
       this.mainContainer.ease({
@@ -542,64 +527,29 @@ export default class SearchLightExt extends Extension {
     // this._hidePopups();
   }
 
-  _findGridSearchResults(actor) {
-    if (!actor) {
-      return null;
-    }
-    if (actor.style_class === 'grid-search-results') {
-      return actor;
-    }
-    let c = actor.get_first_child();
-    while (c) {
-      let found = this._findGridSearchResults(c);
-      if (found) {
-        return found;
-      }
-      c = c.get_next_sibling();
-    }
-    return null;
-  }
-
-  _actorHasActiveDrag(actor, depth) {
-    if (!actor || depth < 0) {
-      return false;
-    }
-    if (
-      actor._draggable &&
-      actor._draggable._dragState === 1 /* DragState.DRAGGING */
-    ) {
-      return true;
-    }
-    let c = actor.get_first_child();
-    while (c) {
-      if (this._actorHasActiveDrag(c, depth - 1)) {
-        return true;
-      }
-      c = c.get_next_sibling();
-    }
-    return false;
-  }
-
   _isDraggingIcon() {
+    // cancel all drag
+    let result = false;
     try {
-      if (!this._searchResults) {
-        return false;
-      }
-      let grid = this._findGridSearchResults(this._searchResults);
-      if (!grid) {
-        return false;
-      }
-      let c = grid.get_first_child();
-      while (c) {
-        if (c.visible && this._actorHasActiveDrag(c, 4)) {
-          return true;
+      if (this._searchResults) {
+        let grid =
+          this._searchResults._content.first_child.first_child.child.child;
+        if (grid.style_class == 'grid-search-results') {
+          grid.get_children().forEach((c) => {
+            // console.log(`${c._name} ${c._draggable._dragState}`);
+            if (
+              c._draggable &&
+              c._draggable._dragState == 1 /* DragState.DRAGGING */
+            ) {
+              result = true;
+            }
+          });
         }
-        c = c.get_next_sibling();
       }
     } catch (err) {
-      logError(err);
+      console.log(err);
     }
-    return false;
+    return result;
   }
 
   _layout() {
@@ -611,6 +561,27 @@ export default class SearchLightExt extends Extension {
       600 + ((this.sw * this.scaleFactor) / 2) * (this.scale_width || 0);
     this.height =
       400 + ((this.sh * this.scaleFactor) / 2) * (this.scale_height || 0);
+
+    // initial height
+    let font_size = 14;
+    if (this.font_size) {
+      font_size = this.font_size_options[this.font_size];
+    }
+    if (this.entry_font_size) {
+      font_size = this.entry_font_size_options[this.entry_font_size];
+    }
+
+    // let padding = {
+    //   14: 14 * 2.5,
+    //   16: 16 * 2.4,
+    //   18: 18 * 2.2,
+    //   20: 20 * 2.0,
+    //   22: 22 * 1.8,
+    //   24: 24 * 1.6,
+    // };
+    // this.initial_height = padding[font_size] * this.scaleFactor;
+    // this.initial_height += font_size * 2 * this.scaleFactor;
+    // console.log(`${this.initial_height} ${this._entry.height}`);
 
     this.initial_height = this._entry.height + 4 * this.scaleFactor;
 
@@ -650,7 +621,7 @@ export default class SearchLightExt extends Extension {
     } catch (err) {
       //
     }
-    if (shortcut === '') {
+    if (shortcut == '') {
       shortcut = '<Control><Super>Space';
     }
 
@@ -668,7 +639,7 @@ export default class SearchLightExt extends Extension {
     } catch (err) {
       //
     }
-    if (shortcut === '') {
+    if (shortcut == '') {
       shortcut = '<Control><Super>Space';
     }
 
@@ -679,9 +650,9 @@ export default class SearchLightExt extends Extension {
 
   _queryDisplay() {
     let idx = this.preferred_monitor || 0;
-    if (idx === 0) {
+    if (idx == 0) {
       idx = Main.layoutManager.primaryIndex;
-    } else if (idx === Main.layoutManager.primaryIndex) {
+    } else if (idx == Main.layoutManager.primaryIndex) {
       idx = 0;
     }
     this.monitor =
@@ -704,7 +675,7 @@ export default class SearchLightExt extends Extension {
     this.sw = this.monitor.width;
     this.sh = this.monitor.height;
 
-    if (this._last_monitor_count !== Main.layoutManager.monitors.length) {
+    if (this._last_monitor_count != Main.layoutManager.monitors.length) {
       this._settings.set_int(
         'monitor-count',
         Main.layoutManager.monitors.length,
@@ -829,14 +800,16 @@ export default class SearchLightExt extends Extension {
     }
   }
 
-  _updateCss(_disable) {
+  _updateCss(disable) {
     let bg = this.background_color || [0, 0, 0, 0.5];
     if (this.text_color && this.text_color[3] > 0) {
       this.container.remove_style_class_name('light');
-    } else if (0.3 * bg[0] + 0.59 * bg[1] + 0.11 * bg[2] < 0.5) {
-      this.container.remove_style_class_name('light');
     } else {
-      this.container.add_style_class_name('light');
+      if (0.3 * bg[0] + 0.59 * bg[1] + 0.11 * bg[2] < 0.5) {
+        this.container.remove_style_class_name('light');
+      } else {
+        this.container.add_style_class_name('light');
+      }
     }
 
     if (this._background) {
@@ -870,24 +843,24 @@ export default class SearchLightExt extends Extension {
       styles.push(`#searchLightBlurredBackground {${ss.join(' ')}}`);
     }
 
-    if (this._background) {
-      if (
-        this.blur_background &&
-        this.desktop_background_blurred &&
-        this.monitor
-      ) {
-        let sw = this.monitor.width;
-        let sh = this.monitor.height;
-        let ss = [];
-        ss.push(
-          `\n background-image: url("${this.desktop_background_blurred}");`,
-        );
-        ss.push(`\n background-size: ${sw}px ${sh}px;`);
-        ss.push('\n background-position: top center;');
-        this._background.style = ss.join(' ');
-      } else {
-        this._background.style = '';
-      }
+    // ss.push(`\n background-image: url("${bg}");`);
+    if (
+      this.blur_background &&
+      this.desktop_background_blurred &&
+      this.monitor &&
+      this._background
+    ) {
+      let sw = this.monitor.width;
+      let sh = this.monitor.height;
+      let ss = [];
+      ss.push(
+        `\n background-image: url("${this.desktop_background_blurred}");`,
+      );
+      ss.push(`\n background-size: ${sw}px ${sh}px;`);
+      ss.push(`\n background-position: top center;`);
+      this._background.style = ss.join(' ');
+    } else if (this._background) {
+      this._background.style = '';
     }
 
     {
@@ -896,10 +869,10 @@ export default class SearchLightExt extends Extension {
         let r = rads[Math.floor(this.border_radius)];
         if (r) {
           let st = `StBoxLayout.search-section-content { border-radius: ${r}px !important; }`;
-          st = `#searchLightBlurredBackgroundImage,\n${st}`; // has no effect
-          st = `#searchLightBlurredBackground,\n${st}`; // has no effect
-          st = `#searchLightBox,\n${st}`;
-          st = `#searchLight,\n${st}`;
+          st = '#searchLightBlurredBackgroundImage,\n' + st; // has no effect
+          st = '#searchLightBlurredBackground,\n' + st; // has no effect
+          st = '#searchLightBox,\n' + st;
+          st = '#searchLight,\n' + st;
           styles.push(st);
         }
       }
@@ -929,9 +902,9 @@ export default class SearchLightExt extends Extension {
     {
       let ss = [];
       {
-        let panelClr = this._style.rgba(this.panel_icon_color);
+        let clr = this._style.rgba(this.panel_icon_color);
         if (this.panel_icon_color[3] > 0) {
-          ss.push(`\n  color: rgba(${panelClr}) !important;`);
+          ss.push(`\n  color: rgba(${clr}) !important;`);
         }
       }
       styles.push(`.panel-status-indicator-icon {${ss.join(' ')}}`);
@@ -1018,41 +991,46 @@ export default class SearchLightExt extends Extension {
         },
       ]);
     } catch (err) {
-      logError(err);
+      console.log(err);
     }
   }
 
-  _onFocusWindow(_w, _e) {}
+  _onFocusWindow(w, e) {}
 
-  _onKeyFocusChanged(_previous) {
-    if (!this._entry || !this._searchResults) return;
-    let focus = global.stage.get_key_focus();
-    let appearFocused =
-      focus && (this._entry.contains(focus) || this._searchResults.contains(focus));
+  _onKeyFocusChanged(previous) {
+    try {
+      if (!this._entry || !this._searchResults) return;
+      let focus = global.stage.get_key_focus();
+      let appearFocused =
+        focus && (this._entry.contains(focus) || this._searchResults.contains(focus));
 
-    if (!appearFocused) {
-      // popups are not handled well.. hide immediately
-      if (
-        focus &&
-        focus.style_class &&
-        focus.style_class.includes('popup-menu')
-      ) {
-        this._lastPopup = focus;
-        this._hidePopups();
+      if (!appearFocused) {
+        // popups are not handled well.. hide immediately
+        if (
+          focus &&
+          focus.style_class &&
+          focus.style_class.includes('popup-menu')
+        ) {
+          this._lastPopup = focus;
+          this._hidePopups();
+        }
+
+        this.hide();
       }
 
-      this.hide();
-    }
-
-    // hide window immediately when activated
-    if (focus && focus.activate) {
-      if (!focus._activate) {
-        focus._activate = focus.activate;
-        focus.activate = () => {
-          this.mainContainer.opacity = 0;
-          focus._activate();
-        };
+      // hide window immediately when activated
+      if (focus && focus.activate) {
+        if (!focus._activate) {
+          focus._activate = focus.activate;
+          focus.activate = () => {
+            if (!this.mainContainer) return;
+            this.mainContainer.opacity = 0;
+            focus._activate();
+          };
+        }
       }
+    } catch (e) {
+      logError(e);
     }
   }
 
